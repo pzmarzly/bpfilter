@@ -18,6 +18,7 @@ static int _bf_matcher_generate_set_trie(struct bf_program *program,
     assert(program);
     assert(matcher);
 
+    uint32_t set_index = *(uint32_t *)bf_matcher_payload(matcher);
     const struct bf_set *set =
         bf_chain_get_set_for_matcher(program->runtime.chain, matcher);
     enum bf_matcher_type type = set->key[0];
@@ -25,10 +26,11 @@ static int _bf_matcher_generate_set_trie(struct bf_program *program,
     int r;
 
     if (!set) {
-        return bf_err_r(-ENOENT, "set #%u not found in %s",
-                        *(uint32_t *)bf_matcher_payload(matcher),
+        return bf_err_r(-ENOENT, "set #%u not found in %s", set_index,
                         program->runtime.chain->name);
     }
+
+    const struct bf_set_mapping *mapping = &program->set_mappings[set_index];
 
     r = bf_stub_rule_check_protocol(program, meta);
     if (r)
@@ -67,8 +69,7 @@ static int _bf_matcher_generate_set_trie(struct bf_program *program,
                         bf_matcher_type_to_str(type), type);
     }
 
-    EMIT_LOAD_SET_FD_FIXUP(program, BPF_REG_1,
-                           *(uint32_t *)bf_matcher_payload(matcher));
+    EMIT_LOAD_SET_FD_FIXUP(program, BPF_REG_1, mapping->map_index);
     EMIT(program, BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
     EMIT(program, BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, BF_PROG_SCR_OFF(4)));
     EMIT(program, BPF_EMIT_CALL(BPF_FUNC_map_lookup_elem));
@@ -84,19 +85,21 @@ int bf_matcher_generate_set(struct bf_program *program,
     assert(program);
     assert(matcher);
 
+    uint32_t set_index = *(uint32_t *)bf_matcher_payload(matcher);
     const struct bf_set *set =
         bf_chain_get_set_for_matcher(program->runtime.chain, matcher);
     size_t offset = 0;
     int r;
 
     if (!set) {
-        return bf_err_r(-ENOENT, "set #%u not found in %s",
-                        *(uint32_t *)bf_matcher_payload(matcher),
+        return bf_err_r(-ENOENT, "set #%u not found in %s", set_index,
                         program->runtime.chain->name);
     }
 
     if (set->use_trie)
         return _bf_matcher_generate_set_trie(program, matcher);
+
+    const struct bf_set_mapping *mapping = &program->set_mappings[set_index];
 
     // Ensure the packet uses the required protocols
     for (size_t i = 0; i < set->n_comps; ++i) {
@@ -136,14 +139,20 @@ int bf_matcher_generate_set(struct bf_program *program,
         offset += meta->hdr_payload_size;
     }
 
-    EMIT_LOAD_SET_FD_FIXUP(program, BPF_REG_1,
-                           *(uint32_t *)bf_matcher_payload(matcher));
+    EMIT_LOAD_SET_FD_FIXUP(program, BPF_REG_1, mapping->map_index);
     EMIT(program, BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
     EMIT(program, BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, BF_PROG_SCR_OFF(0)));
     EMIT(program, BPF_EMIT_CALL(BPF_FUNC_map_lookup_elem));
 
-    // Jump to the next rule if map_lookup_elem returned 0
+    // Jump to the next rule if key not found (NULL)
     EMIT_FIXUP_JMP_NEXT_RULE(program, BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 0));
+
+    // Load the uint64_t bitmask value and check this set's bit
+    EMIT(program, BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_0, 0));
+    EMIT(program, BPF_MOV64_IMM(BPF_REG_2, 1));
+    EMIT(program, BPF_ALU64_IMM(BPF_LSH, BPF_REG_2, mapping->bit));
+    EMIT(program, BPF_ALU64_REG(BPF_AND, BPF_REG_1, BPF_REG_2));
+    EMIT_FIXUP_JMP_NEXT_RULE(program, BPF_JMP_IMM(BPF_JEQ, BPF_REG_1, 0, 0));
 
     return 0;
 }
