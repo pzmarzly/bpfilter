@@ -110,6 +110,117 @@ int bf_program_new(struct bf_program **program, const struct bf_chain *chain,
     _program->fixups = bf_list_default(bf_fixup_free, NULL);
     _program->handle = handle;
 
+    char name[BPF_OBJ_NAME_LEN];
+    size_t n_chain_sets = bf_list_size(&chain->sets);
+    _program->n_set_mappings = n_chain_sets;
+
+    _program->set_mappings =
+        calloc(n_chain_sets + 1, sizeof(struct bf_set_mapping));
+    if (!_program->set_mappings)
+        return -ENOMEM;
+
+    for (size_t i = 0; i < n_chain_sets; ++i)
+        _program->set_mappings[i].map_index = SIZE_MAX;
+
+    struct bf_hash_group hash_groups[64];
+    size_t n_hash_groups = 0;
+
+    struct bf_map_spec map_specs[128];
+    size_t n_map_specs = 0;
+
+    size_t set_idx = 0;
+    bf_list_foreach (&chain->sets, set_node) {
+        struct bf_set *set = bf_list_node_get_data(set_node);
+        assert(set_idx < n_chain_sets);
+
+        if (bf_set_is_empty(set)) {
+            set_idx++;
+            continue;
+        }
+
+        if (set->use_trie) {
+            if (n_map_specs >= ARRAY_SIZE(map_specs)) {
+                return bf_err_r(-E2BIG, "too many set maps (max %lu)",
+                                ARRAY_SIZE(map_specs));
+            }
+
+            size_t spec_idx = n_map_specs++;
+            map_specs[spec_idx].set = set;
+            map_specs[spec_idx].value_size = 1;
+            map_specs[spec_idx].total_elems = bf_list_size(&set->elems);
+            map_specs[spec_idx].name_idx = set_idx;
+
+            _program->set_mappings[set_idx].map_index = spec_idx;
+            _program->set_mappings[set_idx].bit = 0;
+        } else {
+            size_t g_idx = SIZE_MAX;
+            for (size_t gi = 0; gi < n_hash_groups; ++gi) {
+                if (hash_groups[gi].n_comps == set->n_comps &&
+                    hash_groups[gi].elem_size == set->elem_size &&
+                    memcmp(hash_groups[gi].key, set->key,
+                           set->n_comps * sizeof(enum bf_matcher_type)) == 0) {
+                    g_idx = gi;
+                    break;
+                }
+            }
+
+            if (g_idx == SIZE_MAX) {
+                if (n_hash_groups >= ARRAY_SIZE(hash_groups)) {
+                    return bf_err_r(-E2BIG,
+                                    "too many distinct hash set key formats");
+                }
+                if (n_map_specs >= ARRAY_SIZE(map_specs)) {
+                    return bf_err_r(-E2BIG, "too many set maps (max %lu)",
+                                    ARRAY_SIZE(map_specs));
+                }
+
+                g_idx = n_hash_groups++;
+
+                hash_groups[g_idx].n_comps = set->n_comps;
+                memcpy(hash_groups[g_idx].key, set->key,
+                       set->n_comps * sizeof(enum bf_matcher_type));
+                hash_groups[g_idx].elem_size = set->elem_size;
+                hash_groups[g_idx].next_bit = 0;
+
+                size_t spec_idx = n_map_specs++;
+                hash_groups[g_idx].map_spec_index = spec_idx;
+                map_specs[spec_idx].set = set;
+                map_specs[spec_idx].value_size = sizeof(uint64_t);
+                map_specs[spec_idx].total_elems = 0;
+                map_specs[spec_idx].name_idx = set_idx;
+            }
+
+            if (hash_groups[g_idx].next_bit >= 64) {
+                return bf_err_r(
+                    -E2BIG, "more than 64 hash sets share the same key format");
+            }
+
+            size_t spec_idx = hash_groups[g_idx].map_spec_index;
+            _program->set_mappings[set_idx].map_index = spec_idx;
+            _program->set_mappings[set_idx].bit = hash_groups[g_idx].next_bit++;
+            map_specs[spec_idx].total_elems += bf_list_size(&set->elems);
+        }
+
+        set_idx++;
+    }
+
+    for (size_t i = 0; i < n_map_specs; ++i) {
+        _free_bf_map_ struct bf_map *map = NULL;
+
+        (void)snprintf(name, BPF_OBJ_NAME_LEN, _BF_SET_MAP_PREFIX "%04x",
+                       (uint8_t)map_specs[i].name_idx);
+
+        r = bf_map_new_from_set(&map, name, map_specs[i].set,
+                                map_specs[i].value_size,
+                                map_specs[i].total_elems);
+        if (r < 0)
+            return r;
+
+        r = bf_list_push(&handle->sets, (void **)&map);
+        if (r < 0)
+            return r;
+    }
+
     r = bf_printer_new(&_program->printer);
     if (r)
         return r;
@@ -125,6 +236,7 @@ void bf_program_free(struct bf_program **program)
         return;
 
     bf_list_clean(&(*program)->fixups);
+    free((*program)->set_mappings);
     free((*program)->img);
 
     bf_printer_free(&(*program)->printer);
@@ -711,65 +823,188 @@ static int _bf_program_load_log_map(struct bf_program *program)
     return 0;
 }
 
-static int _bf_program_load_sets_maps(struct bf_program *new_prog)
+/**
+ * Tracks a group of hash sets that share the same key format and will be
+ * merged into a single BPF map.
+ */
+struct bf_hash_group
 {
-    char name[BPF_OBJ_NAME_LEN];
-    size_t set_idx = 0;
+    size_t n_comps;
+    enum bf_matcher_type key[BF_SET_MAX_N_COMPS];
+    size_t elem_size;
+    size_t map_spec_index;
+    uint8_t next_bit;
+};
+
+/**
+ * Describes a BPF map to be created for sets during bf_program_new.
+ */
+struct bf_map_spec
+{
+    const struct bf_set *set;
+    size_t value_size;
+    size_t total_elems;
+    uint32_t name_idx;
+};
+
+static int _bf_program_load_trie_map(struct bf_program *prog,
+                                     struct bf_map *map, size_t map_idx)
+{
+    size_t chain_set_idx = SIZE_MAX;
     int r;
 
-    assert(new_prog);
-
-    bf_list_foreach (&new_prog->runtime.chain->sets, set_node) {
-        struct bf_set *set = bf_list_node_get_data(set_node);
-        _free_bf_map_ struct bf_map *map = NULL;
-        _cleanup_free_ uint8_t *values = NULL;
-        _cleanup_free_ uint8_t *keys = NULL;
-        size_t nelems = bf_list_size(&set->elems);
-        size_t idx = 0;
-
-        if (!nelems) {
-            r = bf_list_add_tail(&new_prog->handle->sets, NULL);
-            if (r)
-                return r;
-            continue;
+    for (size_t i = 0; i < prog->n_set_mappings; ++i) {
+        if (prog->set_mappings[i].map_index == map_idx) {
+            chain_set_idx = i;
+            break;
         }
+    }
 
-        (void)snprintf(name, BPF_OBJ_NAME_LEN, _BF_SET_MAP_PREFIX "%04x",
-                       (uint8_t)set_idx++);
-        r = bf_map_new_from_set(&map, name, set);
-        if (r)
-            return r;
+    if (chain_set_idx == SIZE_MAX)
+        return bf_err_r(-ENOENT, "no contributing set for trie map %lu",
+                        map_idx);
 
-        values = malloc(nelems);
-        if (!values)
-            return bf_err_r(-errno, "failed to allocate map values");
+    struct bf_set *set =
+        bf_list_get_at(&prog->runtime.chain->sets, chain_set_idx);
+    size_t nelems = bf_list_size(&set->elems);
 
-        keys = malloc(set->elem_size * nelems);
-        if (!keys)
-            return bf_err_r(errno, "failed to allocate map keys");
+    _cleanup_free_ uint8_t *keys = malloc(set->elem_size * nelems);
+    _cleanup_free_ uint8_t *values = malloc(nelems);
+    if (!keys || !values)
+        return bf_err_r(-ENOMEM, "failed to allocate trie set data");
+
+    size_t idx = 0;
+    bf_list_foreach (&set->elems, elem_node) {
+        void *elem = bf_list_node_get_data(elem_node);
+        memcpy(keys + (idx * set->elem_size), elem, set->elem_size);
+        values[idx] = 1;
+        ++idx;
+    }
+
+    r = bf_bpf_map_update_batch(map->fd, keys, values, nelems, BPF_ANY);
+    if (r < 0)
+        return bf_err_r(r, "failed to add trie set elements to the map");
+
+    return 0;
+}
+
+static int _bf_program_load_hash_map(struct bf_program *prog,
+                                     struct bf_map *map, size_t map_idx)
+{
+    int r;
+
+    size_t first_set_idx = SIZE_MAX;
+    for (size_t i = 0; i < prog->n_set_mappings; ++i) {
+        if (prog->set_mappings[i].map_index == map_idx) {
+            first_set_idx = i;
+            break;
+        }
+    }
+
+    if (first_set_idx == SIZE_MAX)
+        return bf_err_r(-ENOENT, "no contributing set for hash map %lu",
+                        map_idx);
+
+    struct bf_set *first_set =
+        bf_list_get_at(&prog->runtime.chain->sets, first_set_idx);
+    size_t elem_size = first_set->elem_size;
+
+    size_t total_elems = 0;
+    for (size_t i = 0; i < prog->n_set_mappings; ++i) {
+        if (prog->set_mappings[i].map_index == map_idx) {
+            struct bf_set *set = bf_list_get_at(&prog->runtime.chain->sets, i);
+            total_elems += bf_list_size(&set->elems);
+        }
+    }
+
+    _cleanup_free_ uint8_t *keys = malloc(elem_size * total_elems);
+    _cleanup_free_ uint64_t *values = calloc(total_elems, sizeof(uint64_t));
+    if (!keys || !values)
+        return bf_err_r(-ENOMEM, "failed to allocate merged set data");
+
+    size_t n_unique = 0;
+
+    for (size_t i = 0; i < prog->n_set_mappings; ++i) {
+        if (prog->set_mappings[i].map_index != map_idx)
+            continue;
+
+        struct bf_set *set = bf_list_get_at(&prog->runtime.chain->sets, i);
+        uint64_t bit_mask = (uint64_t)1 << prog->set_mappings[i].bit;
 
         bf_list_foreach (&set->elems, elem_node) {
             void *elem = bf_list_node_get_data(elem_node);
 
-            memcpy(keys + (idx * set->elem_size), elem, set->elem_size);
-            values[idx] = 1;
-            ++idx;
+            bool found = false;
+            for (size_t k = 0; k < n_unique; ++k) {
+                if (memcmp(keys + (k * elem_size), elem, elem_size) == 0) {
+                    values[k] |= bit_mask;
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found) {
+                memcpy(keys + (n_unique * elem_size), elem, elem_size);
+                values[n_unique] = bit_mask;
+                n_unique++;
+            }
         }
+    }
 
-        r = bf_bpf_map_update_batch(map->fd, keys, values, nelems, BPF_ANY);
-        if (r)
-            return bf_err_r(r, "failed to add set elements to the map");
-
-        r = bf_list_push(&new_prog->handle->sets, (void **)&map);
-        if (r)
-            return r;
-    };
-
-    r = _bf_program_fixup(new_prog, BF_FIXUP_TYPE_SET_MAP_FD);
-    if (r)
-        return r;
+    if (n_unique > 0) {
+        r = bf_bpf_map_update_batch(map->fd, keys, values, n_unique, BPF_ANY);
+        if (r < 0)
+            return bf_err_r(r, "failed to add merged set elements to the map");
+    }
 
     return 0;
+}
+
+static int _bf_program_load_sets_maps(struct bf_program *prog)
+{
+    size_t map_idx = 0;
+    int r;
+
+    assert(prog);
+
+    bf_list_foreach (&prog->handle->sets, map_node) {
+        struct bf_map *map = bf_list_node_get_data(map_node);
+
+        if (!map) {
+            map_idx++;
+            continue;
+        }
+
+        r = bf_map_create(map);
+        if (r < 0) {
+            r = bf_err_r(r, "failed to create BPF map for set");
+            goto err_destroy_maps;
+        }
+
+        if (map->bpf_type == BF_BPF_MAP_TYPE_LPM_TRIE)
+            r = _bf_program_load_trie_map(prog, map, map_idx);
+        else
+            r = _bf_program_load_hash_map(prog, map, map_idx);
+
+        if (r < 0)
+            goto err_destroy_maps;
+
+        map_idx++;
+    }
+
+    r = _bf_program_fixup(prog, BF_FIXUP_TYPE_SET_MAP_FD);
+    if (r < 0)
+        goto err_destroy_maps;
+
+    return 0;
+
+err_destroy_maps:
+    bf_list_foreach (&prog->handle->sets, map_node) {
+        struct bf_map *map = bf_list_node_get_data(map_node);
+        if (map)
+            bf_map_destroy(map);
+    }
+    return r;
 }
 
 int bf_program_load(struct bf_program *prog)

@@ -189,6 +189,24 @@ struct bf_counter;
 struct bf_hookopts;
 struct bf_handle;
 
+/**
+ * Maps an original chain set index to its merged BPF map and bitmask bit.
+ *
+ * When multiple hash-based sets share the same key format, they are merged
+ * into a single BPF map. Each entry's value is a @c uint64_t bitmask where
+ * each bit indicates membership in a specific original set.
+ */
+struct bf_set_mapping
+{
+    /** Index into program->sets for the merged map, or SIZE_MAX for empty
+     * sets. */
+    size_t map_index;
+
+    /** Bit position in the uint64_t bitmask value (0-63). For trie maps
+     * (which are never merged), this is always 0. */
+    uint8_t bit;
+};
+
 struct bf_program
 {
     enum bf_flavor flavor;
@@ -207,6 +225,11 @@ struct bf_program
     size_t img_size;
     size_t img_cap;
     bf_list fixups;
+
+    /// Maps each original chain set index to its merged map index and bitmask
+    /// bit. Array of length @c n_set_mappings, or NULL if no sets.
+    struct bf_set_mapping *set_mappings;
+    size_t n_set_mappings;
 
     /** Runtime data used to interact with the program and cache information.
      * This data is not serialized. */

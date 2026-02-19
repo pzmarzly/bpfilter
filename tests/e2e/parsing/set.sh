@@ -75,7 +75,23 @@ make_sandbox
 ${FROM_NS} ${BFCLI} chain set --from-str "chain test BF_HOOK_XDP{ifindex=${NS_IFINDEX}} ACCEPT
     rule (ip4.saddr) in { 192.168.1.1 } DROP
     rule (ip4.saddr) in {} ACCEPT"
-# Verify only 1 set map was pinned (empty set should not create a map)
+# Empty set should not create a map
 MAP_COUNT=$(${FROM_NS} find ${WORKDIR}/bpf/bpfilter/test/ -name 'bf_set_*' | wc -l)
 [ "${MAP_COUNT}" -eq 1 ] || { echo "ERROR: Expected 1 set map, found ${MAP_COUNT}"; exit 1; }
+
+# Two sets with same (ip4.saddr) key should be merged into 1 BPF map
+${FROM_NS} bfcli ruleset flush
+${FROM_NS} bfcli chain set --from-str "chain test BF_HOOK_XDP{ifindex=${NS_IFINDEX}} ACCEPT
+    rule (ip4.saddr) in { 192.168.1.1 } DROP
+    rule (ip4.saddr) in { 192.168.1.2 } DROP"
+MAP_COUNT=$(${FROM_NS} find ${WORKDIR}/bpf/bpfilter/test/ -name 'bf_set_*' | wc -l)
+[ "${MAP_COUNT}" -eq 1 ] || { echo "ERROR: Expected 1 merged set map, found ${MAP_COUNT}"; exit 1; }
+
+# Sets with different key formats should NOT be merged
+${FROM_NS} bfcli ruleset flush
+${FROM_NS} bfcli chain set --from-str "chain test BF_HOOK_XDP{ifindex=${NS_IFINDEX}} ACCEPT
+    rule (ip4.saddr) in { 192.168.1.1 } DROP
+    rule (ip4.daddr) in { 10.0.0.1 } DROP"
+MAP_COUNT=$(${FROM_NS} find ${WORKDIR}/bpf/bpfilter/test/ -name 'bf_set_*' | wc -l)
+[ "${MAP_COUNT}" -eq 2 ] || { echo "ERROR: Expected 2 set maps for different keys, found ${MAP_COUNT}"; exit 1; }
 
